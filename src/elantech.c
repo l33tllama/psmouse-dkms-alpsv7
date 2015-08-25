@@ -313,7 +313,7 @@ static void elantech_report_semi_mt_data(struct input_dev *dev,
 					 unsigned int x2, unsigned int y2)
 {
 	elantech_set_slot(dev, 0, num_fingers != 0, x1, y1);
-	elantech_set_slot(dev, 1, num_fingers == 2, x2, y2);
+	elantech_set_slot(dev, 1, num_fingers >= 2, x2, y2);
 }
 
 /*
@@ -472,8 +472,13 @@ static void elantech_report_absolute_v3(struct psmouse *psmouse,
 	input_report_key(dev, BTN_TOOL_FINGER, fingers == 1);
 	input_report_key(dev, BTN_TOOL_DOUBLETAP, fingers == 2);
 	input_report_key(dev, BTN_TOOL_TRIPLETAP, fingers == 3);
-	input_report_key(dev, BTN_LEFT, packet[0] & 0x01);
-	input_report_key(dev, BTN_RIGHT, packet[0] & 0x02);
+	/* For clickpads map both buttons to BTN_LEFT */
+	if (etd->fw_version & 0x001000) {
+		input_report_key(dev, BTN_LEFT, packet[0] & 0x03);
+	} else {
+		input_report_key(dev, BTN_LEFT, packet[0] & 0x01);
+		input_report_key(dev, BTN_RIGHT, packet[0] & 0x02);
+	}
 	input_report_abs(dev, ABS_PRESSURE, pres);
 	input_report_abs(dev, ABS_TOOL_WIDTH, width);
 
@@ -483,10 +488,17 @@ static void elantech_report_absolute_v3(struct psmouse *psmouse,
 static void elantech_input_sync_v4(struct psmouse *psmouse)
 {
 	struct input_dev *dev = psmouse->dev;
+	struct elantech_data *etd = psmouse->private;
 	unsigned char *packet = psmouse->packet;
 
-	input_report_key(dev, BTN_LEFT, packet[0] & 0x01);
-	input_report_key(dev, BTN_RIGHT, packet[0] & 0x02);
+	/* For clickpads map both buttons to BTN_LEFT */
+	if (etd->fw_version & 0x001000) {
+		input_report_key(dev, BTN_LEFT, packet[0] & 0x03);
+	} else {
+		input_report_key(dev, BTN_LEFT, packet[0] & 0x01);
+		input_report_key(dev, BTN_RIGHT, packet[0] & 0x02);
+		input_report_key(dev, BTN_MIDDLE, packet[0] & 0x04);
+	}
 	input_mt_report_pointer_emulation(dev, true);
 	input_sync(dev);
 }
@@ -700,6 +712,8 @@ static int elantech_packet_check_v3(struct psmouse *psmouse)
 
 		if ((packet[0] & 0x0c) == 0x0c && (packet[3] & 0xce) == 0x0c)
 			return PACKET_V3_TAIL;
+		if ((packet[3] & 0x0f) == 0x06)
+			return PACKET_TRACKPOINT;
 	}
 
 	return PACKET_UNKNOWN;
@@ -710,16 +724,24 @@ static int elantech_packet_check_v4(struct psmouse *psmouse)
 	struct elantech_data *etd = psmouse->private;
 	unsigned char *packet = psmouse->packet;
 	unsigned char packet_type = packet[3] & 0x03;
+	unsigned int ic_version;
 	bool sanity_check;
+	if (etd->tp_dev && (packet[3] & 0x0f) == 0x06)
+		return PACKET_TRACKPOINT;
 
+	/* This represents the version of IC body. */
+	ic_version = (etd->fw_version & 0x0f0000) >> 16;
 	/*
 	 * Sanity check based on the constant bits of a packet.
 	 * The constant bits change depending on the value of
-	 * the hardware flag 'crc_enabled' but are the same for
-	 * every packet, regardless of the type.
+	 * the hardware flag 'crc_enabled' and the version of
+	 * the IC body but are the same for * every packet, 
+	 * regardless of the type.
 	 */
 	if (etd->crc_enabled)
 		sanity_check = ((packet[3] & 0x08) == 0x00);
+		else if (ic_version == 7 && etd->samples[1] == 0x2A)
+			sanity_check = ((packet[3] & 0x1c) == 0x10);
 	else
 		sanity_check = ((packet[0] & 0x0c) == 0x04 &&
 				(packet[3] & 0x1c) == 0x10);
@@ -776,22 +798,38 @@ static psmouse_ret_t elantech_process_byte(struct psmouse *psmouse)
 
 	case 3:
 		packet_type = elantech_packet_check_v3(psmouse);
-		/* ignore debounce */
-		if (packet_type == PACKET_DEBOUNCE)
-			return PSMOUSE_FULL_PACKET;
+		switch (packet_type) {
+			case PACKET_UNKNOWN:
+				return PSMOUSE_BAD_DATA;
 
-		if (packet_type == PACKET_UNKNOWN)
-			return PSMOUSE_BAD_DATA;
+			case PACKET_DEBOUNCE:
+				/* ignore debounce */
+				break;
 
-		elantech_report_absolute_v3(psmouse, packet_type);
+			case PACKET_TRACKPOINT:
+				//elantech_report_trackpoint(psmouse, packet_type);
+				break;
+
+			default:
+				elantech_report_absolute_v3(psmouse, packet_type);
+				break;
+		}
 		break;
 
 	case 4:
 		packet_type = elantech_packet_check_v4(psmouse);
-		if (packet_type == PACKET_UNKNOWN)
-			return PSMOUSE_BAD_DATA;
+		switch (packet_type) {
+			case PACKET_UNKNOWN:
+				return PSMOUSE_BAD_DATA;
 
-		elantech_report_absolute_v4(psmouse, packet_type);
+			case PACKET_TRACKPOINT:
+				//elantech_report_trackpoint(psmouse, packet_type);
+				break;
+
+			default:
+				elantech_report_absolute_v4(psmouse, packet_type);
+				break;
+		}
 		break;
 	}
 
@@ -831,7 +869,10 @@ static int elantech_set_absolute_mode(struct psmouse *psmouse)
 		break;
 
 	case 3:
-		etd->reg_10 = 0x0b;
+		if (etd->set_hw_resolution)
+			etd->reg_10 = 0x0b;
+		else
+			etd->reg_10 = 0x01;
 		if (elantech_write_reg(psmouse, 0x10, etd->reg_10))
 			rc = -1;
 
@@ -1030,7 +1071,7 @@ static int elantech_set_input_params(struct psmouse *psmouse)
 	struct input_dev *dev = psmouse->dev;
 	struct elantech_data *etd = psmouse->private;
 	unsigned int x_min = 0, y_min = 0, x_max = 0, y_max = 0, width = 0;
-	unsigned int x_res = 0, y_res = 0;
+	unsigned int x_res = 31, y_res = 31;
 
 	if (elantech_set_range(psmouse, &x_min, &y_min, &x_max, &y_max, &width))
 		return -1;
@@ -1233,7 +1274,14 @@ static bool elantech_is_signature_valid(const unsigned char *param)
 
 	if (param[1] == 0)
 		return true;
-
+	/*
+	 * Some hw_version >= 4 models have a revision higher then 20. Meaning
+	 * that param[2] may be 10 or 20, skip the rates check for these.
+	 */
+	if ((param[0] & 0x0f) >= 0x06 && (param[1] & 0xaf) == 0x0f &&
+	    param[2] < 40)
+		return true;	
+	
 	for (i = 0; i < ARRAY_SIZE(rates); i++)
 		if (param[2] == rates[i])
 			return false;
@@ -1353,6 +1401,10 @@ static int elantech_set_properties(struct elantech_data *etd)
 		case 6:
 		case 7:
 		case 8:
+		case 9:
+		case 10:
+		case 13:
+		case 14:
 			etd->hw_version = 4;
 			break;
 		default:
