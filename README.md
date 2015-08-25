@@ -3,6 +3,8 @@ psmouse-dkms-alpsv7
 
 Linux kernel driver for newer ALPS touchpads (as of Mar 2014)
 
+Modified to hopefully work with Lenovo E450...
+
 QUICK START
 -----------
 :loudspeaker: Make sure you have `dkms` and `linux-headers` installed in your system: :loudspeaker:
